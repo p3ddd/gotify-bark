@@ -34,6 +34,8 @@ type BarkForwardPlugin struct {
 	done chan struct{}
 	// config holds the user-provided configuration
 	config *Config
+	// httpClient is a shared HTTP client with timeout for Bark requests
+	httpClient *http.Client
 }
 
 // Config defines the plugin config scheme.
@@ -94,6 +96,11 @@ func (c *BarkForwardPlugin) Enable() error {
 
 	// Initialize the done channel
 	c.done = make(chan struct{})
+
+	// Initialize HTTP client with timeout
+	c.httpClient = &http.Client{
+		Timeout: 30 * time.Second,
+	}
 
 	// Start the message listening goroutine
 	go c.listenForMessages()
@@ -197,33 +204,39 @@ func (c *BarkForwardPlugin) listenForMessages() {
 // It returns an error if the connection is broken, or nil if it's cleanly closed via the 'done' channel.
 func (c *BarkForwardPlugin) readMessages(conn *websocket.Conn) error {
 	for {
+		// Check for disable signal first
 		select {
 		case <-c.done:
-			// The plugin was disabled, so we should disconnect and exit.
 			log.Println("Bark Forwarder: Received disable signal, disconnecting WebSocket.")
-			// Cleanly close the connection.
-			err := conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-			if err != nil {
-				log.Printf("Bark Forwarder: Error sending close message: %v", err)
-			}
-			return nil // Clean exit
+			_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			return nil
 		default:
-			// Read message from WebSocket
-			_, messageBytes, err := conn.ReadMessage()
-			if err != nil {
-				return err // Connection error
-			}
+		}
 
-			var msg plugin.Message
-			if err := json.Unmarshal(messageBytes, &msg); err != nil {
-				log.Printf("Bark Forwarder: Error unmarshalling message: %v", err)
+		// Set read deadline to allow periodic checking of done channel
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+		_, messageBytes, err := conn.ReadMessage()
+		if err != nil {
+			// Check if it's a timeout - if so, just continue to check done channel
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				return err
+			}
+			if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
 				continue
 			}
+			return err
+		}
 
-			// Forward the message to Bark
-			if err := c.forwardToBark(msg); err != nil {
-				log.Printf("Bark Forwarder: Failed to forward message to Bark: %v", err)
-			}
+		var msg plugin.Message
+		if err := json.Unmarshal(messageBytes, &msg); err != nil {
+			log.Printf("Bark Forwarder: Error unmarshalling message: %v", err)
+			continue
+		}
+
+		// Forward the message to Bark
+		if err := c.forwardToBark(msg); err != nil {
+			log.Printf("Bark Forwarder: Failed to forward message to Bark: %v", err)
 		}
 	}
 }
@@ -250,7 +263,7 @@ func (c *BarkForwardPlugin) forwardToBark(msg plugin.Message) error {
 		return fmt.Errorf("could not marshal bark request: %w", err)
 	}
 
-	resp, err := http.Post(c.config.BarkURL, "application/json", bytes.NewBuffer(jsonValue))
+	resp, err := c.httpClient.Post(c.config.BarkURL, "application/json", bytes.NewBuffer(jsonValue))
 	if err != nil {
 		return fmt.Errorf("http post to bark failed: %w", err)
 	}
