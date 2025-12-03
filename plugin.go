@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,10 +53,14 @@ type Config struct {
 	BarkURL string `yaml:"bark_url"`
 	// ReconnectDelay is the delay in seconds before trying to reconnect.
 	ReconnectDelay int `yaml:"reconnect_delay,omitempty"`
+	// EncryptionKey is the AES encryption key (16 bytes for AES-128, 32 bytes for AES-256). Leave empty to disable encryption.
+	EncryptionKey string `yaml:"encryption_key,omitempty"`
+	// EncryptionIV is the AES CBC initialization vector (must be 16 bytes). Leave empty to disable encryption.
+	EncryptionIV string `yaml:"encryption_iv,omitempty"`
 }
 
 // DefaultConfig implements plugin.Configurer.
-func (c *BarkForwardPlugin) DefaultConfig() interface{} {
+func (c *BarkForwardPlugin) DefaultConfig() any {
 	return &Config{
 		GotifyHost:        "ws://localhost:80",
 		GotifyClientToken: "",
@@ -64,7 +71,7 @@ func (c *BarkForwardPlugin) DefaultConfig() interface{} {
 }
 
 // ValidateAndSetConfig implements plugin.Configurer.
-func (c *BarkForwardPlugin) ValidateAndSetConfig(config interface{}) error {
+func (c *BarkForwardPlugin) ValidateAndSetConfig(config any) error {
 	newConfig := config.(*Config)
 
 	if newConfig.GotifyHost == "" {
@@ -143,6 +150,12 @@ func (c *BarkForwardPlugin) GetDisplay(location *url.URL) string {
 4.  **Bark URL**: 通常保持默认的 'https://api.day.app/push' 即可。
 
 5.  **Reconnect Delay**: WebSocket 断线后自动重连的等待时间（秒），默认为 10 秒。
+
+6.  **Encryption Key** (可选): AES 加密密钥。
+    -   支持 16 字节 (AES-128) 或 32 字节 (AES-256)。
+    -   留空则不启用加密。
+
+7.  **Encryption IV** (可选): AES CBC 初始化向量，必须为 16 字节。
 
 **重要提示**: 每次修改配置后，请**禁用**再**重新启用**本插件以使新配置生效。
 `
@@ -251,19 +264,46 @@ func (c *BarkForwardPlugin) forwardToBark(msg plugin.Message) error {
 		"body":       msg.Message,
 	}
 
-	// Extract optional params from extras, just like before
+	// Extract optional params from extras
 	if extras, ok := msg.Extras["bark::params"]; ok {
 		if params, ok := extras.(map[string]any); ok {
 			maps.Copy(barkReq, params)
 		}
 	}
 
-	jsonValue, err := json.Marshal(barkReq)
-	if err != nil {
-		return fmt.Errorf("could not marshal bark request: %w", err)
+	var requestBody []byte
+	var err error
+
+	// Check if encryption is enabled
+	if c.config.EncryptionKey != "" && c.config.EncryptionIV != "" {
+		// Encrypt the request
+		jsonValue, err := json.Marshal(barkReq)
+		if err != nil {
+			return fmt.Errorf("could not marshal bark request: %w", err)
+		}
+
+		ciphertext, err := c.encryptAESCBC(jsonValue)
+		if err != nil {
+			return fmt.Errorf("encryption failed: %w", err)
+		}
+
+		encryptedReq := map[string]string{
+			"ciphertext": ciphertext,
+		}
+		requestBody, err = json.Marshal(encryptedReq)
+		if err != nil {
+			return fmt.Errorf("could not marshal encrypted request: %w", err)
+		}
+		log.Println("Bark Forwarder: Using encrypted push.")
+	} else {
+		// Plain request
+		requestBody, err = json.Marshal(barkReq)
+		if err != nil {
+			return fmt.Errorf("could not marshal bark request: %w", err)
+		}
 	}
 
-	resp, err := c.httpClient.Post(c.config.BarkURL, "application/json", bytes.NewBuffer(jsonValue))
+	resp, err := c.httpClient.Post(c.config.BarkURL, "application/json", bytes.NewBuffer(requestBody))
 	if err != nil {
 		return fmt.Errorf("http post to bark failed: %w", err)
 	}
@@ -275,6 +315,40 @@ func (c *BarkForwardPlugin) forwardToBark(msg plugin.Message) error {
 
 	log.Println("Bark Forwarder: Successfully forwarded message to Bark.")
 	return nil
+}
+
+// encryptAESCBC encrypts plaintext using AES-CBC with PKCS7 padding.
+func (c *BarkForwardPlugin) encryptAESCBC(plaintext []byte) (string, error) {
+	key := []byte(c.config.EncryptionKey)
+	iv := []byte(c.config.EncryptionIV)
+
+	// Validate key length (16 for AES-128, 32 for AES-256)
+	if len(key) != 16 && len(key) != 32 {
+		return "", errors.New("encryption key must be 16 or 32 bytes")
+	}
+
+	// Validate IV length (must be 16 bytes for AES)
+	if len(iv) != aes.BlockSize {
+		return "", fmt.Errorf("encryption IV must be %d bytes", aes.BlockSize)
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("failed to create cipher: %w", err)
+	}
+
+	// Apply PKCS7 padding
+	padding := aes.BlockSize - len(plaintext)%aes.BlockSize
+	padText := bytes.Repeat([]byte{byte(padding)}, padding)
+	plaintext = append(plaintext, padText...)
+
+	// Encrypt
+	ciphertext := make([]byte, len(plaintext))
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(ciphertext, plaintext)
+
+	// Return base64 encoded ciphertext
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
 // NewGotifyPluginInstance creates a plugin instance.
