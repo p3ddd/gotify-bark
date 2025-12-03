@@ -12,6 +12,7 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -290,6 +291,7 @@ func (c *BarkForwardPlugin) forwardToBark(msg plugin.Message) error {
 	var err error
 
 	// Check if encryption is enabled
+	var targetURL string
 	if c.config.EncryptionKey != "" && c.config.EncryptionIV != "" {
 		// Encrypt the request
 		jsonValue, err := json.Marshal(barkReq)
@@ -310,15 +312,17 @@ func (c *BarkForwardPlugin) forwardToBark(msg plugin.Message) error {
 			return fmt.Errorf("could not marshal encrypted request: %w", err)
 		}
 		log.Println("Bark Forwarder: Using encrypted push.")
+		targetURL = encryptedPushURL(c.config.BarkURL, c.config.BarkDeviceKey)
 	} else {
 		// Plain request
 		requestBody, err = json.Marshal(barkReq)
 		if err != nil {
 			return fmt.Errorf("could not marshal bark request: %w", err)
 		}
+		targetURL = plainPushURL(c.config.BarkURL)
 	}
 
-	resp, err := c.httpClient.Post(c.config.BarkURL, "application/json", bytes.NewBuffer(requestBody))
+	resp, err := c.httpClient.Post(targetURL, "application/json", bytes.NewBuffer(requestBody))
 	if err != nil {
 		return fmt.Errorf("http post to bark failed: %w", err)
 	}
@@ -375,4 +379,26 @@ func main() {
 	// This plugin is not meant to be run as a standalone application.
 	// It should be built as a Go plugin and loaded by Gotify.
 	panic("this should be built as go plugin")
+}
+
+func plainPushURL(baseURL string) string {
+	if baseURL == "" {
+		return "https://api.day.app/push"
+	}
+	baseURL = strings.TrimSpace(baseURL)
+	baseURL = strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(baseURL, "/push") {
+		return baseURL
+	}
+	return baseURL + "/push"
+}
+
+func encryptedPushURL(baseURL, deviceKey string) string {
+	if baseURL == "" {
+		baseURL = "https://api.day.app"
+	}
+	baseURL = strings.TrimSpace(baseURL)
+	baseURL = strings.TrimSuffix(baseURL, "/push")
+	baseURL = strings.TrimRight(baseURL, "/")
+	return fmt.Sprintf("%s/%s", baseURL, deviceKey)
 }
