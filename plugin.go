@@ -216,29 +216,41 @@ func (c *BarkForwardPlugin) listenForMessages() {
 // readMessages is a helper function to read messages from an active WebSocket connection.
 // It returns an error if the connection is broken, or nil if it's cleanly closed via the 'done' channel.
 func (c *BarkForwardPlugin) readMessages(conn *websocket.Conn) error {
-	for {
-		// Check for disable signal first
+	// Use a separate goroutine to monitor done channel and close connection
+	// This avoids the "repeated read on failed websocket connection" panic
+	// that occurs when using ReadDeadline timeouts
+	closedByDone := make(chan struct{})
+	go func() {
 		select {
 		case <-c.done:
-			log.Println("Bark Forwarder: Received disable signal, disconnecting WebSocket.")
+			log.Println("Bark Forwarder: Received disable signal, closing WebSocket.")
 			_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-			return nil
-		default:
+			_ = conn.Close()
+			close(closedByDone)
+		case <-closedByDone:
+			// Connection closed by read error, exit goroutine
 		}
+	}()
 
-		// Set read deadline to allow periodic checking of done channel
-		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer func() {
+		// Signal the monitor goroutine to exit if still running
+		select {
+		case <-closedByDone:
+		default:
+			close(closedByDone)
+		}
+	}()
 
+	for {
 		_, messageBytes, err := conn.ReadMessage()
 		if err != nil {
-			// Check if it's a timeout - if so, just continue to check done channel
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				return err
+			// Check if closed by done signal
+			select {
+			case <-c.done:
+				return nil // Clean shutdown
+			default:
 			}
-			if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
-				continue
-			}
-			return err
+			return err // Connection error
 		}
 
 		var msg plugin.Message
