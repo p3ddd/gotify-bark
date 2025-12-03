@@ -24,7 +24,7 @@ import (
 func GetGotifyPluginInfo() plugin.Info {
 	return plugin.Info{
 		ModulePath:  "github.com/p3ddd/gotify-bark",
-		Version:     "0.1.0",
+		Version:     "0.2.0",
 		Author:      "Petrichor",
 		Website:     "https://github.com/p3ddd/gotify-bark",
 		License:     "MIT",
