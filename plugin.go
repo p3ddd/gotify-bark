@@ -1,0 +1,276 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"maps"
+	"net/http"
+	"net/url"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/gotify/plugin-api"
+)
+
+// GetGotifyPluginInfo returns gotify plugin info.
+func GetGotifyPluginInfo() plugin.Info {
+	return plugin.Info{
+		ModulePath:  "github.com/p3ddd/gotify-bark",
+		Version:     "0.0.1",
+		Author:      "Petrichor",
+		Website:     "https://github.com/p3ddd/gotify-bark",
+		License:     "MIT",
+		Description: "Forwards Gotify messages to Bark by acting as a WebSocket client.",
+		Name:        "Bark Forwarder",
+	}
+}
+
+// BarkForwardPlugin is the gotify plugin instance for forwarding messages to Bark.
+type BarkForwardPlugin struct {
+	// done channel is used to signal the goroutine to stop
+	done chan struct{}
+	// config holds the user-provided configuration
+	config *Config
+}
+
+// Config defines the plugin config scheme.
+type Config struct {
+	// The WebSocket URL of the Gotify server, e.g., "ws://localhost:80"
+	GotifyHost string `yaml:"gotify_host"`
+	// A client token from Gotify for the plugin to use
+	GotifyClientToken string `yaml:"gotify_client_token"`
+	// The device key for your Bark account
+	BarkDeviceKey string `yaml:"bark_device_key"`
+	// The Bark server push URL
+	BarkURL string `yaml:"bark_url"`
+	// ReconnectDelay is the delay in seconds before trying to reconnect.
+	ReconnectDelay int `yaml:"reconnect_delay,omitempty"`
+}
+
+// DefaultConfig implements plugin.Configurer.
+func (c *BarkForwardPlugin) DefaultConfig() interface{} {
+	return &Config{
+		GotifyHost:        "ws://localhost:80",
+		GotifyClientToken: "",
+		BarkDeviceKey:     "",
+		BarkURL:           "https://api.day.app/push",
+		ReconnectDelay:    10,
+	}
+}
+
+// ValidateAndSetConfig implements plugin.Configurer.
+func (c *BarkForwardPlugin) ValidateAndSetConfig(config interface{}) error {
+	newConfig := config.(*Config)
+
+	if newConfig.GotifyHost == "" {
+		return errors.New("config: GotifyHost cannot be empty")
+	}
+	if newConfig.GotifyClientToken == "" {
+		return errors.New("config: GotifyClientToken cannot be empty. Create a client in Gotify for this plugin")
+	}
+	if newConfig.BarkDeviceKey == "" {
+		return errors.New("config: BarkDeviceKey key cannot be empty")
+	}
+	if newConfig.BarkURL == "" {
+		return errors.New("config: BarkURL cannot be empty")
+	}
+	if newConfig.ReconnectDelay <= 0 {
+		newConfig.ReconnectDelay = 10
+	}
+
+	c.config = newConfig
+	log.Println("Bark Forwarder plugin configuration updated and validated.")
+	return nil
+}
+
+// Enable enables the plugin.
+func (c *BarkForwardPlugin) Enable() error {
+	if c.config == nil {
+		return errors.New("plugin is not configured yet")
+	}
+
+	// Initialize the done channel
+	c.done = make(chan struct{})
+
+	// Start the message listening goroutine
+	go c.listenForMessages()
+
+	log.Println("Bark Forwarder (WebSocket) plugin enabled.")
+	return nil
+}
+
+// Disable disables the plugin.
+func (c *BarkForwardPlugin) Disable() error {
+	// Signal the goroutine to stop by closing the done channel
+	if c.done != nil {
+		close(c.done)
+	}
+	log.Println("Bark Forwarder (WebSocket) plugin disabled.")
+	return nil
+}
+
+// GetDisplay implements plugin.Displayer.
+// This method provides instructions on the plugin's page in the Gotify UI.
+func (c *BarkForwardPlugin) GetDisplay(location *url.URL) string {
+	return `
+### Bark Forwarder 设置说明
+
+本插件是为将 Gotify 消息转发到 Bark 而设计的专用插件。它通过连接到 Gotify 的 WebSocket 消息流来接收所有消息，并将其转发到你的 Bark 客户端。
+
+**请按以下步骤配置：**
+
+1.  **Gotify Host**: 填写你的 Gotify 服务器的 WebSocket 地址。
+    -   例如: 如果你的 Gotify 访问地址是 'http://192.168.1.10:8080'，这里就填 'ws://192.168.1.10:8080'。
+    -   如果使用了 HTTPS，请使用 'wss://'。
+
+2.  **Gotify Client Token**: 需要为本插件创建一个专用的客户端 Token。
+    -   请前往 Gotify 的 **"Clients"** 标签页。
+    -   点击 "Create Client"，取一个名字（例如 'bark-plugin-client'）。
+    -   **复制生成的 Token** 并粘贴到此处。
+
+3.  **Bark Device Key**: 填写你的 Bark 客户端对应的设备 Key。
+
+4.  **Bark URL**: 通常保持默认的 'https://api.day.app/push' 即可。
+
+5.  **Reconnect Delay**: WebSocket 断线后自动重连的等待时间（秒），默认为 10 秒。
+
+**重要提示**: 每次修改配置后，请**禁用**再**重新启用**本插件以使新配置生效。
+`
+}
+
+// listenForMessages connects to the Gotify WebSocket and forwards messages.
+// It runs in a loop to handle reconnections automatically.
+func (c *BarkForwardPlugin) listenForMessages() {
+	defer log.Println("Bark Forwarder: Listener stopped.")
+
+	wsURL := c.config.GotifyHost + "/stream?token=" + c.config.GotifyClientToken
+
+	for {
+		// Check for disable signal before attempting to connect.
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+
+		log.Printf("Bark Forwarder: Connecting to %s", wsURL)
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err != nil {
+			log.Printf("Bark Forwarder: WebSocket dial error: %v", err)
+			log.Printf("Bark Forwarder: Reconnecting in %d seconds...", c.config.ReconnectDelay)
+			// Wait before reconnecting, but also listen for the done signal.
+			select {
+			case <-time.After(time.Duration(c.config.ReconnectDelay) * time.Second):
+				continue
+			case <-c.done:
+				return
+			}
+		}
+
+		log.Println("Bark Forwarder: Successfully connected to Gotify WebSocket.")
+
+		// We have a connection, now we read messages until an error or disable signal.
+		err = c.readMessages(conn)
+		_ = conn.Close() // Ensure connection is closed on error or clean exit.
+
+		if err == nil {
+			// If readMessages returned nil, it means a clean shutdown was requested.
+			return
+		}
+
+		log.Printf("Bark Forwarder: Disconnected: %v", err)
+
+		// If we are here, it's due to a read error. Wait before reconnecting.
+		select {
+		case <-time.After(time.Duration(c.config.ReconnectDelay) * time.Second):
+			continue
+		case <-c.done:
+			return
+		}
+	}
+}
+
+// readMessages is a helper function to read messages from an active WebSocket connection.
+// It returns an error if the connection is broken, or nil if it's cleanly closed via the 'done' channel.
+func (c *BarkForwardPlugin) readMessages(conn *websocket.Conn) error {
+	for {
+		select {
+		case <-c.done:
+			// The plugin was disabled, so we should disconnect and exit.
+			log.Println("Bark Forwarder: Received disable signal, disconnecting WebSocket.")
+			// Cleanly close the connection.
+			err := conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			if err != nil {
+				log.Printf("Bark Forwarder: Error sending close message: %v", err)
+			}
+			return nil // Clean exit
+		default:
+			// Read message from WebSocket
+			_, messageBytes, err := conn.ReadMessage()
+			if err != nil {
+				return err // Connection error
+			}
+
+			var msg plugin.Message
+			if err := json.Unmarshal(messageBytes, &msg); err != nil {
+				log.Printf("Bark Forwarder: Error unmarshalling message: %v", err)
+				continue
+			}
+
+			// Forward the message to Bark
+			if err := c.forwardToBark(msg); err != nil {
+				log.Printf("Bark Forwarder: Failed to forward message to Bark: %v", err)
+			}
+		}
+	}
+}
+
+// forwardToBark sends the message to the configured Bark server.
+func (c *BarkForwardPlugin) forwardToBark(msg plugin.Message) error {
+	log.Printf("Bark Forwarder: Forwarding message '%s' to Bark.", msg.Title)
+
+	barkReq := map[string]any{
+		"device_key": c.config.BarkDeviceKey,
+		"title":      msg.Title,
+		"body":       msg.Message,
+	}
+
+	// Extract optional params from extras, just like before
+	if extras, ok := msg.Extras["bark::params"]; ok {
+		if params, ok := extras.(map[string]any); ok {
+			maps.Copy(barkReq, params)
+		}
+	}
+
+	jsonValue, err := json.Marshal(barkReq)
+	if err != nil {
+		return fmt.Errorf("could not marshal bark request: %w", err)
+	}
+
+	resp, err := http.Post(c.config.BarkURL, "application/json", bytes.NewBuffer(jsonValue))
+	if err != nil {
+		return fmt.Errorf("http post to bark failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bark server returned non-200 status: %s", resp.Status)
+	}
+
+	log.Println("Bark Forwarder: Successfully forwarded message to Bark.")
+	return nil
+}
+
+// NewGotifyPluginInstance creates a plugin instance.
+func NewGotifyPluginInstance(ctx plugin.UserContext) plugin.Plugin {
+	return &BarkForwardPlugin{}
+}
+
+func main() {
+	// This plugin is not meant to be run as a standalone application.
+	// It should be built as a Go plugin and loaded by Gotify.
+	panic("this should be built as go plugin")
+}
