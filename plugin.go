@@ -12,6 +12,7 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -220,13 +221,19 @@ func (c *BarkForwardPlugin) readMessages(conn *websocket.Conn) error {
 	// This avoids the "repeated read on failed websocket connection" panic
 	// that occurs when using ReadDeadline timeouts
 	closedByDone := make(chan struct{})
+	var closeClosedByDone sync.Once
+	safeClose := func() {
+		closeClosedByDone.Do(func() {
+			close(closedByDone)
+		})
+	}
 	go func() {
 		select {
 		case <-c.done:
 			log.Println("Bark Forwarder: Received disable signal, closing WebSocket.")
 			_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 			_ = conn.Close()
-			close(closedByDone)
+			safeClose()
 		case <-closedByDone:
 			// Connection closed by read error, exit goroutine
 		}
@@ -234,11 +241,7 @@ func (c *BarkForwardPlugin) readMessages(conn *websocket.Conn) error {
 
 	defer func() {
 		// Signal the monitor goroutine to exit if still running
-		select {
-		case <-closedByDone:
-		default:
-			close(closedByDone)
-		}
+		safeClose()
 	}()
 
 	for {
